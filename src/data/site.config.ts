@@ -10,7 +10,7 @@ interface SiteConfig {
 }
 
 export const siteConfig: SiteConfig = {
-	site: 'https://monoamine11231.github.io/', // Write here your website url
+	site: 'https://ioannis.sh/', // Write here your website url
 	author: 'Ioannis', // Site author
 	title: 'Ioannis\' Notes', // Site title.
 	description: 'Programming, Cybersecurity & ML notes.', // Description to display in the meta tags
