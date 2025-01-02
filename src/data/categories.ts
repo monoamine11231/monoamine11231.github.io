@@ -3,5 +3,5 @@ export const CATEGORIES = [
 	'Programming',
 	'Algorithms',
 	'Cybersecurity',
-	'Machine Learning',
+	'Machine Learning'
 ] as const
