@@ -1,0 +1,145 @@
+---
+title: 'SYCL-OpenGL Interoperability'
+description: 'Proof of concept on partial interoperability between OpenGL and SYCL using CUDA backend and discussion on cross-platform solutions.'
+pubDate: 'Jan 13 2025'
+heroImage: '../../assets/images/sycl-x-opengl.jpg'
+category: 'Programming'
+tags: ['sycl', 'cuda', 'opencl', 'opengl']
+---
+
+# Introduction
+A good time ago I stumbled across a problem when implementing a path tracer in SYCL which arose while trying to move the path tracer's graphic output into a GLFW window framebuffer.
+As we all know, GLFW can operate directly with Vulkan and OpenGL by creating a GLFW context, but such a possibility doesn't exist with SYCL. This leads to the next question: how would one be able to access and modify the framebuffer of a GLFW window from SYCL? The answer to that question would depend on the window creation library used (X11, wayland-client, GLFW, etc) but in this case we are limited to the use of GLFW which makes the problem a bit more complicated but also more interesting to solve! As a disclaimer I need to mention that the solution provided in this blog-post is **not** a cross-platform one, but it provides useful insights and code for implementing one!
+
+As it was mentioned previously, SYCL and GLFW don't provide a direct communication pipeline, but GLFW provides one for OpenGL! OpenGL also provides various ways to draw pixelbuffers directly to the GLFW window which is exactly what we need. But there is a catch, translating the problem to establishing a communication between OpenGL and SYCL (also known as interoperability) isn't necessarily easier. Matter of fact, as of January 2025 there is no official implementation of interoperability methods between SYCL and OpenGL, although they exist between SYCL and OpenCL [[1]](https://community.intel.com/t5/Intel-oneAPI-DPC-C-Compiler/How-to-interoperate-with-OpenGL-using-OpenCL-interop-interface/m-p/1219535). Interoperability between OpenGL and OpenCL is not optimal and not possible on all GPU's, so the problem must be approached from another perspective. The solution is to break the cross-platformability of SYCL and allow the GPU's native API's to register the resources allocated and used by OpenGL.
+
+# Proof of Concept: OpenGL → CUDA + SYCL
+To transfer a resource from OpenGL to CUDA, that resource needs to be allocated first by OpenGL. In the case of buffers, `glGenBuffers` and `glBufferData` can be used in a classical manner as illustrated below:
+```c++
+GLuint pbo;
+// Generate exactly 1 buffer
+glGenBuffers(1, &pbo);
+// Bind to the newly generated buffer
+glBindBuffer(GL_ARRAY_BUFFER, pbo);
+// Allocate the video memory for that buffer
+glBufferData(GL_ARRAY_BUFFER, WIDTH*HEIGHT*3, NULL, GL_DYNAMIC_DRAW);
+// Unbind the buffer
+glBindBuffer(GL_ARRAY_BUFFER, 0);
+```
+
+Now that a buffer resource has been allocated by OpenGL the resource can be mapped to CUDA and to SYCL by utilizing CUDA's runtime API. Installing a CUDA package doesn't only provide to `nvcc` but also to a set of header-files for use with C++ which include the needed `cuda_runtime.h` and `cuda_gl_interop.h`. These header-files provide methods for mapping OpenGL resources to a CUDA runtime context and working with CUDA runtime contexts per-se.
+
+A OpenGL buffer resource can be mapped to a CUDA resource using the `cudaGraphicsGLRegisterBuffer`, `cudaGraphicsMapResources`, and `cudaGraphicsResourceGetMappedPointer` methods which are well-documented [[2]](https://docs.nvidia.com/cuda/cuda-runtime-api/index.html). The idea is to register the OpenGL resource and map it to the CUDA runtime context which in turn can be extracted from a SYCL GPU device with a CUDA backend. Easier said than done, so let's move to the implementation code:
+```c++
+// Pick the NVIDIA GPU
+// When working with multiple GPU's a device selector must be implemented
+// https://stackoverflow.com/a/69572571
+sycl::device gpu(sycl::gpu_selector_v);
+// Create the device command queue
+sycl::queue q(gpu);
+
+// Extract the CUDA runtime context from the CUDA GPU using OneAPI's backend
+CUstream custream = sycl::get_native<sycl::backend::ext_oneapi_cuda>(q);
+
+cudaGraphicsResource *gresource;
+void *gresource_ptr;
+size_t gresource_size;
+
+// Register the OpenGL buffer to a CUDA resource
+cudaGraphicsGLRegisterBuffer(&gresource, pbo, cudaGraphicsRegisterFlagsWriteDiscard);
+// Map the newly registered CUDA resource to the CUDA runtime context
+cudaGraphicsMapResources(1, &gresource, custream);
+// Extract the device pointer from the newly registered resource to the OpenGL buffer
+cudaGraphicsResourceGetMappedPointer(&gresource_ptr, &gresource_size, gresource);
+```
+
+`cudaGraphicsResourceGetMappedPointer` sets the device pointer to the resource originally allocated by OpenGL which can be easily used in a SYCL kernel by wrapping the pointer to a `sycl::device_pointer<T>`:
+```c++
+auto program = [=](sycl::nd_item<2> it) {
+  sycl::device_ptr<uint8_t> buffer(reinterpret_cast<uint8_t*>(gresource_ptr));
+  uint8_t a = buffer[0];
+  a += 22;
+  // cudaGraphicsResourceGetMappedPointer is needed for synchronization
+  buffer[1] = a;
+}
+
+q.submit([&](sycl::handler& h) {
+  sycl::range<2> global_range{WIDTH, HEIGHT};
+  sycl::range<2> local_range{2, 2};
+  h.parallel_for(sycl::nd_range{global_range,local_range}, program);
+}).wait_and_throw();
+```
+
+Freeing the resources originally allocated by OpenGL and shared with CUDA now require an additional step that consists of performing a `cudaGraphicsUnmapResources` on the CUDA shared resource:
+```c++
+cudaGraphicsUnmapResources(1, &gresource, custream);
+```
+...and later-on the resource can be deallocated from OpenGL by executing `glDeleteBuffers`.
+
+**NOTE**: Performing `cudaGraphicsUnmapResources` is essential to guarantee a synchronization between the work performed on SYCL's side on the buffer and OpenGL!
+
+
+An example code for OpenGL buffer interoperability with SYCL using CUDA runtime API can be seen in my SYCL pathtracer [[3]](https://github.com/monoamine11231/Example-SYCL-Pathtracer/blob/master/main.cc).
+
+# Cross-platformability?
+Now that you know how to share buffers allocated by OpenGL with SYCL using the CUDA backend of the device, we can return to the main problem of this approach which is the problem of cross-platformability: What if we want to use a AMD GPU or an OpenCL device? To answer this question we can dive into the different provided GPU backends.
+
+## AMD HIP
+As with the CUDA interoperability example, the native context must be first extracted from the SYCL device. The AMD HIP context of a SYCL AMD GPU device can be extracted in the following way:
+```c++
+hipStream_t hipstream = sycl::get_native<sycl::backend::ext_oneapi_hip>(q);
+```
+As with CUDA, AMD HIP provides a set of methods for interoperability with OpenGL which are nearly-identical to the methods provided by CUDA runtime API [[4]](https://rocm.docs.amd.com/projects/HIP/en/docs-6.0.0/doxygen/html/group___g_l.html). A theoretical and non-tested setup to register and map a buffer resource from OpenGL to a HIP context can be seen below:
+```c++
+hipGraphicsResource *gresource;
+void *gresource_ptr;
+size_t gresource_size;
+
+// Register the OpenGL buffer to a CUDA resource
+hipGraphicsGLRegisterBuffer(&gresource, pbo, hipGraphicsRegisterFlagsWriteDiscard);
+// Map the newly registered CUDA resource to the CUDA runtime context
+hipGraphicsMapResources(1, &gresource, hipstream);
+// Extract the device pointer from the newly registered resource to the OpenGL buffer
+hipGraphicsResourceGetMappedPointer(&gresource_ptr, &gresource_size, gresource);
+```
+
+The `gresource_ptr` can be wrapped inside `sycl::device_pointer<T>` in a SYCL kernel program as it was shown above with the CUDA example.
+
+## OpenCL
+A variety of different devices run OpenCL including Intel's new discrete GPU's which make OpenCL an important backend to consider in the interoperability problem.
+
+The provided interoperability between OpenCL and OpenGL uses a slightly different API style compared to the ones provided by HIP and CUDA but overall the method of work is preserved. Let's see an example of how such an interoperability operation would look with OpenCL and SYCL!
+```c++
+// sycl::context must be extracted explicitely from a sycl::queue for cl_context
+cl_context clcontext = sycl::get_native<sycl::backend::opencl>(q.get_context());
+cl_command_queue clqueue = sycl::get_native<sycl::backend::opencl>(q);
+
+// cl_mem is opaque and a device pointer can't be extracted
+cl_mem clbuffer = clCreateFromGLBuffer(clcontext, CL_MEM_READ_WRITE, pbo, NULL);
+sycl::buffer<char, 1> buffer = sycl::make_buffer<sycl::backend::opencl, char>(
+                                  clbuffer, q.get_context());
+
+// Acquire the resources from OpenGL
+clEnqueueAcquireGLObjects(clqueue, 1, &clbuffer, 0, NULL, NULL);
+
+// Run the SYCL kernel and wait for it to finish
+// In the SYCL kernel modify `buffer`
+
+// Release the resources from kernel to OpenGL and synchronize
+clEnqueueReleaseGLObjects(clqueue, 1, &clbuffer, 0, NULL, NULL);
+```
+
+As you may see here OpenCL works with opaque structs that describe memory blocks on the device side instead of dealing with raw pointers as it is done with CUDA. This enforces the programmer to additionally translate the registered OpenGL resource from OpenCL to a SYCL memory-wrapper object.
+
+## Limitations
+The reader may find quite apparent that CUDA & HIP uses a different API style for working with device buffers than that of OpenCL which in turn creates difficulties in implementing cross-platform OpenGL-SYCL interoperability manually.
+
+So far we talked about interoperability between OpenGL and the different API backends for buffers, but the real difficulties arise when trying to implement a cross-platform interoperability with OpenGL texture objects. CUDA allows registering and mapping OpenGL textures in the same way as buffers, **but** the access methods are different. CUDA texture data is accessed and modified by creating an underlying surface object which can subsequently be accessed and written to in a CUDA kernel. On the other hand, OpenCL images and their underlying data can be accessed and modified directly inside an OpenCL kernel without additional object creation.
+
+Different access methods and underlying objects complicate the process of implementing a cross-platform interoperability between OpenGL and SYCL manually since the SYCL objects that wrap images and buffers (`sycl::buffer` and `sycl::image`) from various backends cannot be created from the corresponding CUDA, OpenCL & HIP objects in any of the current SYCL implementations (DPC++, ComputeCPP, etc) as of January 2025. Creating SYCL wrapper objects, `sycl::buffer` and `sycl::image`, from the native backend objects would allow for a complete interoperability between SYCL and OpenGL. According to the SYCL specification such SYCL objects would be possible to be created using `sycl::make_image` and `sycl::make_buffer` methods **if** such implementations exist in the used SYCL implementation [[5]](https://github.khronos.org/SYCL_Reference/iface/backend_interop.html#sycl-make).
+
+An important limitation that must be mentioned is that currently such interoperabilities are one-sided, i.e resources can be translated only from OpenGL to SYCL and not the other way around. Such limitations are placed because of the fact that backend API's also provide only a one-sided interoperability with OpenGL.
+
+# Conclusions
+In conclusion the problem of interoperability between OpenGL and SYCL can be partially solved by digging into the different possible API backends and using the native methods for mapping and registering the resources from OpenGL to their native contexts. This can be done individually for CUDA, OpenCL and HIP contexts but combining all the different backends manually remains a problem as of today for all of SYCL implementations. Implementing a complete interoperability will become straight-forward when `sycl::make_image` and `sycl::make_buffer` methods are implemented for the native backend objects of CUDA, HIP & OpenCL. Currently, the only remaining possibility is to keep our heads up and hope for implementation of these methods in the near future.
+
