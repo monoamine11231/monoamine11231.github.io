@@ -11,7 +11,7 @@ interface SiteConfig {
 
 export const siteConfig: SiteConfig = {
 	site: 'https://ioannis.sh/', // Write here your website url
-	author: 'Ioannis', // Site author
+	author: 'Ioannis Notes', // Site author
 	title: 'Ioannis\' Notes', // Site title.
 	description: 'Programming, Cybersecurity & ML notes.', // Description to display in the meta tags
 	lang: 'en-GB',
