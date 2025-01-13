@@ -2,7 +2,7 @@
 title: 'SYCL-OpenGL Interoperability'
 description: 'Proof of concept on partial interoperability between OpenGL and SYCL using CUDA backend and discussion on cross-platform solutions.'
 pubDate: 'Jan 13 2025'
-heroImage: '../../assets/images/sycl-x-opengl.jpg'
+heroImage: '../../assets/images/sycl-x-opengl.webp'
 category: 'Programming'
 tags: ['sycl', 'cuda', 'opencl', 'opengl']
 ---
@@ -13,7 +13,7 @@ As we all know, GLFW can operate directly with Vulkan and OpenGL by creating a G
 
 As it was mentioned previously, SYCL and GLFW don't provide a direct communication pipeline, but GLFW provides one for OpenGL! OpenGL also provides various ways to draw pixelbuffers directly to the GLFW window which is exactly what we need. But there is a catch, translating the problem to establishing a communication between OpenGL and SYCL (also known as interoperability) isn't necessarily easier. Matter of fact, as of January 2025 there is no official implementation of interoperability methods between SYCL and OpenGL, although they exist between SYCL and OpenCL [[1]](https://community.intel.com/t5/Intel-oneAPI-DPC-C-Compiler/How-to-interoperate-with-OpenGL-using-OpenCL-interop-interface/m-p/1219535). Interoperability between OpenGL and OpenCL is not optimal and not possible on all GPU's, so the problem must be approached from another perspective. The solution is to break the cross-platformability of SYCL and allow the GPU's native API's to register the resources allocated and used by OpenGL.
 
-# Proof of Concept: OpenGL → CUDA + SYCL
+# Proof of Concept
 To transfer a resource from OpenGL to CUDA, that resource needs to be allocated first by OpenGL. In the case of buffers, `glGenBuffers` and `glBufferData` can be used in a classical manner as illustrated below:
 ```c++
 GLuint pbo;
