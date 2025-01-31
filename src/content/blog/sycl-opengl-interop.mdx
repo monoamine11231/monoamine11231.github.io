@@ -59,7 +59,7 @@ auto program = [=](sycl::nd_item<2> it) {
   sycl::device_ptr<uint8_t> buffer(reinterpret_cast<uint8_t*>(gresource_ptr));
   uint8_t a = buffer[0];
   a += 22;
-  // cudaGraphicsResourceGetMappedPointer is needed for synchronization
+  // cudaGraphicsUnmapResources is needed for synchronization
   buffer[1] = a;
 }
 
