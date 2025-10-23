@@ -1,0 +1,151 @@
+---
+title: 'SYCL polymorphism using C++14 generic lambdas'
+description: 'Enabling functional polymorphism in SYCL using generic lambdas.'
+pubDate: 'Oct 23 2025'
+heroImage: '../../assets/images/sycl-polymorphism.webp'
+category: 'Programming'
+tags: ['sycl', 'c++']
+---
+
+# Introduction
+When I started working on my implementation of a path tracer using SYCL as the heterogeneous computing framework, I stumbled across one of my first and most important problems: the problem of having polymorphism in SYCL. I needed polymorphism so that rays could be traced through a set of different 3D objects, where each 3D object type implemented its own method for calculating the intersection of a ray with its inner geometrical structure.
+
+Class polymorphism implemented using dynamic dispatch requires the use of virtual tables for mapping the right function of a subclass through function pointers. The only thing you need to know about function pointers is that they are completely prohibited for use in SYCL and many other heterogeneous computing frameworks [[1]](https://www.khronos.org/blog/sycl-2020-what-do-you-need-to-know), since not all heterogeneous devices support function pointers. To solve this problem, I started searching for solutions to enable dynamic polymorphism in SYCL, to finally be able to trace artificial rays through planes, spheres, triangles, and other 3D objects in a compact and smooth way.
+
+# `std::visit` is not compatible with SYCL!
+In my early research, I stumbled across the idea of using C++ `std::variant` and `std::visit` for achieving polymorphism, which was suggested by a Khronos blog post [[1]](https://www.khronos.org/blog/sycl-2020-what-do-you-need-to-know). I have no idea what the blog post writers thought, but `std::visit` requires the use of function pointers, and therefore this technique is not compatible with SYCL since the program will simply not compile.
+
+The usage and generation of function pointers during the compilation of programs utilizing `std::visit` is revealed in the following [blog post](https://pbackus.github.io/blog/beating-stdvisit-without-really-trying.html). The same statement is further supported by this Reddit [post](https://www.reddit.com/r/programming/comments/ddi5wb/comment/f2jrkrc/). Therefore, the use of `std::visit` in a SYCL program is completely impossible because of its underlying use of function pointers.
+
+# Generic lambdas & templated functions
+By skipping `std::visit`, there are only a couple of options remaining for enabling polymorphism in SYCL. One of them is the use of the Curiously Recurring Template Pattern (CRTP), described in Georgi Mirazchiyski’s [blog post](https://codeplay.com/portal/blogs/2019/07/12/enabling-polymorphism-in-sycl-using-the-cpp-idiom-crtp), and the other is the use of generic lambdas and templated functions. The use of CRTP is more complicated than it needs to be for implementing dynamic polymorphism in SYCL, so I started looking into using generic lambdas and templated functions instead.
+
+## How do generic lambdas and templated functions work?
+Generic lambdas are a feature introduced in C++14, which allows parameters in a lambda expression to accept and have a type of `auto` [[2]](https://isocpp.org/wiki/faq/cpp14-language). Such generic lambda expressions are compiled into function objects with a templated `operator()` method containing the logic provided in the constructed lambda expression [[2]](https://isocpp.org/wiki/faq/cpp14-language). For example, the following defined lambda expression:
+```c++
+auto generic_lambda = [](auto x, auto y) {
+    return x + y;
+};
+
+// Example usage
+std::cout << generic_lambda(2,5) << std::endl; // Output: 7
+std::cout << generic_lambda(std::string{"hello "}, std::string{"world!"}) << std::endl; // Output: "hello world!"
+```
+...will compile into a code-piece looking like this [[3]](https://dev.to/visheshpatel/all-about-lambda-function-in-c-from-c-11-to-c-17-3p5h):
+```c++
+struct lambda_x_y {
+    template <class T0, class T1>
+    auto operator()(T0 x, T1 y) {
+        return x + y;
+    }
+};
+```
+Thus, lambda expressions compile into structs with an overloaded `operator()` method, and therefore lambdas are function objects that mimic templated functions. The benefit of generic lambda expressions and templated functions, in general, is the fact that the generated templated `operator()` methods do not use dynamic dispatch with virtual tables and function pointers to find the correct `operator()` method instance based on the supplied parameter types. Templated functions utilize a compile-time mechanism where a templated function method is expanded and generated on demand based on the parameter types that have been supplied to the templated function in the original code [[4]](https://cplusplus.com/doc/oldtutorial/templates/). After the compiler expands and generates the required functions from the templated function with the desired input and output parameter types, static overload resolution is used to call the correct function [[5]](https://en.cppreference.com/w/cpp/language/overload_resolution.html). This static overload resolution is possible because functions with the same function name but different parameter types have different underlying symbol names when compiled into machine code; this effect is called [name mangling](https://en.cppreference.com/w/cpp/language/overload_resolution.html).
+
+## Using generic lambdas & templated functions in SYCL
+Now that we have found a way to mimic polymorphism in a function-pointer-free way, we can try to write some actual polymorphic code in SYCL!
+
+We can begin by defining two inheritance-free structs, `Earth` and `Mars`, with the same function, `double distance2sun()`:
+
+```c++
+struct Earth {
+    SYCL_EXTERNAL double distance2sun() {
+        return 148965302.27;
+    }
+};
+
+struct Mars {
+    SYCL_EXTERNAL double distance2sun() {
+        return 228000000.00;
+    }
+}
+```
+Note that inheritance-free classes/structs are required so that they can be compiled and used in SYCL; otherwise, we enforce the use of virtual tables, which is prohibited in SYCL.
+
+After defining the planet structs with the same member function, we can define a function that computes the relative distance of two planets to each other. We can define one generic lambda version and one templated function version of the proposed function:
+```c++
+<typename A, typename B>
+SYCL_EXTERNAL double relative_distance_template(A &a, B &b) {
+    return std::abs(a.distance2sun() - b.distance2sun());
+}
+
+auto relative_distance_lambda = [](auto &a, auto &b) {
+    return std::abs(a.distance2sun() - b.distance2sun());
+};
+```
+Both functions above will have the exact same desired effect and work with the supplied parameters that implement the `.distance2sun()` member function, as illustrated below:
+```c++
+Earth earth{};
+Mars mars{};
+
+relative_distance_template(earth, mars) // 79034697.73
+relative_distance_template(mars, earth) // 79034697.73
+relative_distance_template(mars, mars)  // 0
+relative_distance_template(earth, earth)// 0
+
+relative_distance_lambda(earth, mars)   // 79034697.73
+relative_distance_lambda(mars, earth)   // 79034697.73
+relative_distance_lambda(mars, mars)    // 0
+relative_distance_lambda(earth, earth)  // 0
+```
+
+If both the generic lambda and templated methods have the exact same behavior, what is the benefit of using one over the other? One huge advantage of generic lambdas over simple templated functions in SYCL is that generic lambdas can be passed around freely by a pointer or by reference. This cannot be done with simple templated functions since, in such cases, a function pointer is directly being extracted, and this is strictly prohibited in SYCL, as mentioned previously. The reason why we can pass generic lambdas by reference or by pointer is that they are compiled into structs with an overridden and templated `operator()` method, as mentioned previously.
+
+With this advantage of generic lambdas, we can, for example, construct a compact for-each applier method in SYCL that applies a given generic lambda to a list of lists of `std::variant`s. This list of lists contains a list of `std::variant`s that correspond to a specific type, so that, e.g., the sublist at index 0 is a list containing `std::variant`s unpacking to `int`s, the sublist at index 1 is a list containing `std::variant`s unpacking to `double`s, and so on. An example piece of code implementing this idea, taken from my SYCL path tracer implementation, is shown below:
+```c++
+template <typename VARIANT>
+class VariantContainer {
+ private:
+  /* Holding an individual vector for each type */
+  StackVector<VARIANT, kStackVectorCapacity>
+      data_[std::variant_size_v<VARIANT>];
+
+  StackVector<VARIANT*, kStackVectorCapacity * std::variant_size_v<VARIANT>>
+      lookup_;
+
+ public:
+  SYCL_EXTERNAL VariantContainer() : data_{}, lookup_{} {};
+
+  /*  Because `std::get<T>` in `variant_iterator` has to accept a constexpr
+      index we cannot simply use a for loop through to go through all types
+      in the given variant and call the function we want. (NOTE that `F func`
+      is a lambda function and not a function pointer because SYCL does not
+      support that.) So instead of having to write a for loop for each type
+      in the given variant manually, we let the compiler do that for us :)
+
+      Example with given variant: `std::variant<std::string, double, int>`:
+          `container.forEach(lambda)` expands at compile time to:
+
+          for(auto it = variant_iterator<std::string>; it != end; i++) {
+              lambda(*it);
+          }
+
+          for(auto it = variant_iterator<double>; it != end; i++) {
+              lambda(*it);
+          }
+
+          for(auto it = variant_iterator<int>; it != end; i++) {
+              lambda(*it);
+          }                                                               */
+  template <typename F, std::size_t I = 0>
+  SYCL_EXTERNAL void forEach(F&& func) const {
+    if constexpr (I < std::variant_size_v<VARIANT>) {
+      for (std::size_t i = 0; i < this->data_[I].size(); i++) {
+        /* We use noexcept `std::get_if` because we can guarantee that variant
+         * indexes out of bounds are not possible */
+        func(*std::get_if<I>(&this->data_[I].at(i)));
+      }
+      forEach<F, I + 1>(std::forward<F>(func));
+    } else {
+      return;
+    }
+  }
+};
+```
+The code and idea above can be applied to easily iterate through all polymorphic objects implementing a ray-object intersection function, which is required when implementing ray tracing algorithms. The same concept is equally useful when modeling complex systems depending on polymorphic behaviour and deploying these systems on heterogeneous devices using SYCL.
+
+# Summary
+In conclusion, while classical polymorphic approaches in C++ through virtual functions and dynamic dispatch aren’t possible in SYCL due to restrictions on function pointers, the use of generic lambdas and templated functions provides a great alternative to such polymorphic approaches. Although alternatives mentioned in various blog posts utilizing vanilla C++ `std::visit` together with `std::variant` aren’t functional with SYCL, there exist additional working alternatives besides just generic lambdas and templated functions, such as CRTPs, mentioned in Georgi Mirazchiyski’s [blog post](https://codeplay.com/portal/blogs/2019/07/12/enabling-polymorphism-in-sycl-using-the-cpp-idiom-crtp). The advantage of using generic lambdas and templated functions over CRTPs is their lightweightness, expressiveness, and freedom that can be used to implement most systems depending on polymorphic behaviour in SYCL. It has been shown that generic lambdas have additional benefits over templated functions since generic lambdas are compiled into struct objects that wrap around an overridden `operator()` method, which in turn can be passed around by a pointer and thus can mimic the SYCL-prohibited function pointers.
+
+
+
